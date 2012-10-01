@@ -260,12 +260,11 @@ private:
     struct taint_info * mpTaintInfo;
 #else
     void*               mOwnerCookie;
-#endif /*WITH_TAINT_BYTE_PARCEL*/
-
 //#ifdef WITH_TAINT_TRACKING
     // Do not #ifdef this field. Parcel is used by a lot of projects
     uint32_t           mTaintTag;
 //#endif
+#endif /*WITH_TAINT_BYTE_PARCEL*/
 
     class Blob {
     public:
