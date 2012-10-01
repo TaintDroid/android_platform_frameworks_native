@@ -59,6 +59,11 @@
 // Maximum size of a blob to transfer in-place.
 static const size_t IN_PLACE_BLOB_LIMIT = 40 * 1024;
 
+#ifdef WITH_TAINT_BYTE_PARCEL
+// sy - default number of tainted objects in parcel
+#define INITIAL_NTAINTS 4
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+
 // XXX This can be made public if we want to provide
 // support for typed data.
 struct small_flat_data
@@ -285,12 +290,19 @@ status_t unflatten_binder(const sp<ProcessState>& proc,
 
 Parcel::Parcel()
 {
+#ifdef WITH_TAINT_BYTE_PARCEL
+    mpTaintInfo = new taint_info;
+    mpTaintInfo->parcelArray = 0;
+#endif /*WITH_TAINT_BYTE_PARCEL*/
     initState();
 }
 
 Parcel::~Parcel()
 {
     freeDataNoInit();
+#ifdef WITH_TAINT_BYTE_PARCEL
+    delete mpTaintInfo;
+#endif /*WITH_TAINT_BYTE_PARCEL*/
 }
 
 const uint8_t* Parcel::data() const
@@ -339,6 +351,10 @@ void Parcel::setDataPosition(size_t pos) const
 {
     mDataPos = pos;
     mNextObjectHint = 0;
+#ifdef WITH_TAINT_BYTE_PARCEL
+    /* sy - TODO: fix taintVector */
+    mpTaintInfo->mCurPos = 0;
+#endif /*WITH_TAINT_BYTE_PARCEL*/
 }
 
 status_t Parcel::setDataCapacity(size_t size)
@@ -398,6 +414,29 @@ status_t Parcel::appendFrom(const Parcel *parcel, size_t offset, size_t len)
             return err;
         }
     }
+    
+#ifdef WITH_TAINT_BYTE_PARCEL
+    // update taint vector
+    //ALOGW("** appendFrom. readTaintVector %p %p **", this, parcel);
+    const taint_in_parcel * tcur = parcel->mpTaintInfo->parcelArray;
+    uint32_t tsize = parcel->mpTaintInfo->mTaintSize;
+    if(tcur) {
+        for(unsigned int i=0;i<tsize;i++)
+        {
+            const struct taint_in_parcel * tp = &tcur[i];
+            if(tp->pos + tp->len <= offset) continue;
+            int pos = tp->pos - offset;
+            int len = tp->len;
+            if(pos < 0)
+            {
+                len += pos;
+                pos = 0;
+            }
+            pos += mDataPos;
+            updateTaint(tp->taint, pos, len);
+        }
+    }
+#endif /*WITH_TAINT_BYTE_PARCEL*/
 
     // append data
     memcpy(mData + mDataPos, data + offset, len);
@@ -443,6 +482,17 @@ status_t Parcel::appendFrom(const Parcel *parcel, size_t offset, size_t len)
             }
         }
     }
+
+#ifdef WITH_TAINT_TRACKING
+#ifdef WITH_TAINT_BYTE_PARCEL
+    /* sy - should be fixed */
+    //LOGW("appendFrom is called!\n");
+    //updateTaint(parcel->getTaint());
+#else
+    /* propagate the taint tag */
+    updateTaint(parcel->mTaintTag, offset, len);
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#endif
 
     return err;
 }
@@ -1241,12 +1291,44 @@ void Parcel::closeFileDescriptors()
 
 const uint8_t* Parcel::ipcData() const
 {
+#ifdef WITH_TAINT_TRACKING
+    /* Ensure most current taint tag is appended (if mData not null) */
+    if (mData) {
+#ifdef WITH_TAINT_BYTE_PARCEL
+        uint32_t vSize = mpTaintInfo->mTaintSize;
+        if(vSize > mpTaintInfo->mCurAllocatedSize)
+        {
+            ALOGW("*** ipcData(%p:%d) -- curAllocatedSize is not enough ***", mData, dataSize());
+            assert(false);
+        }
+        for(unsigned int i=0;i<vSize;i++)
+        {
+            memcpy((mData+dataSize()+i*sizeof(taint_in_parcel)), (uint8_t*)(&mpTaintInfo->parcelArray[i]), sizeof(taint_in_parcel));
+        }
+        memcpy((mData+dataSize()+vSize*sizeof(taint_in_parcel)), (uint8_t*)&vSize, sizeof(uint32_t));
+#else
+        //if (mTaintTag != 0) {
+        //    LOGW("ipcData(%p:%d) -- Parcel Taint = 0x%08x -- mOwner = %p -- this = %p -- &mTaintTag = %p -- mObjects = %p \n", mData, dataSize(), mTaintTag, mOwner, this, &mTaintTag, mObjects);
+        //}
+        memcpy((mData+dataSize()), (uint8_t*)&mTaintTag, sizeof(mTaintTag));
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+    }
+#endif
     return mData;
 }
 
 size_t Parcel::ipcDataSize() const
 {
+#ifdef WITH_TAINT_TRACKING
+    /* Don't add taint tag if mData is null */
+#ifdef WITH_TAINT_BYTE_PARCEL
+    return ((mDataSize > mDataPos ? mDataSize : mDataPos) + (mData ? sizeof(uint32_t) + sizeof(taint_in_parcel)*mpTaintInfo->mTaintSize : 0));
+#else
+    return ((mDataSize > mDataPos ? mDataSize : mDataPos) + (mData ? sizeof(mTaintTag) : 0));
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#else
     return (mDataSize > mDataPos ? mDataSize : mDataPos);
+#endif
 }
 
 const size_t* Parcel::ipcObjects() const
@@ -1265,7 +1347,49 @@ void Parcel::ipcSetDataReference(const uint8_t* data, size_t dataSize,
     freeDataNoInit();
     mError = NO_ERROR;
     mData = const_cast<uint8_t*>(data);
+#ifdef WITH_TAINT_TRACKING
+#ifdef WITH_TAINT_BYTE_PARCEL
+    mpTaintInfo->mTaintSize = 0;
+    mpTaintInfo->mCurPos = 0;
+    if (mData && dataSize >= sizeof(uint32_t)) {
+        size_t tempPos = (dataSize - sizeof(uint32_t));
+        uint32_t vSize = *(uint32_t *)(mData + tempPos);
+        if(vSize > 0)
+        {
+            //ALOGW("ipcSetDataReference(%p:%p) -- TaintSize = %d --\n", mData, this, vSize);
+            tempPos -= vSize * sizeof(taint_in_parcel);
+            mpTaintInfo->parcelArray = (taint_in_parcel *) malloc (vSize * sizeof(taint_in_parcel));
+            
+            for(unsigned int i=0;i<vSize;i++)
+            {
+                memcpy(&(mpTaintInfo->parcelArray[i]), mData + tempPos + sizeof(taint_in_parcel)*i , sizeof(taint_in_parcel));
+                taint_in_parcel * tp = &(mpTaintInfo->parcelArray[i]);
+                //ALOGW("ipcSetDataReference(%p:%p) -- Taint = 0x%08x pos:(%d, %d)--\n", mData, this, tp->taint, tp->pos, tp->len);
+            }
+        }
+        mpTaintInfo->mTaintSize = vSize;
+        mpTaintInfo->mCurAllocatedSize = vSize;
+        mDataSize = mDataCapacity = tempPos;
+    } else {
+        mDataSize = mDataCapacity = dataSize;
+        mpTaintInfo->mCurAllocatedSize = 0;
+    }
+#else
+    // FIXED: no taint tag if data size is less than 4 bytes
+    if (mData && dataSize >= sizeof(mTaintTag)) {
+        mDataSize = mDataCapacity = (dataSize - sizeof(mTaintTag));
+        mTaintTag = *(uint32_t*)(mData+mDataSize);
+        //if (mTaintTag != 0) {
+        //    LOGW("ipcSetDataReference(%p:%d) -- Parcel Taint = 0x%08x --\n", mData, mDataSize, mTaintTag);
+        //}
+    } else {
+        mDataSize = mDataCapacity = dataSize;
+        mTaintTag = 0; /* TAINT_CLEAR */
+    }
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#else
     mDataSize = mDataCapacity = dataSize;
+#endif
     //ALOGI("setDataReference Setting data size of %p to %lu (pid=%d)\n", this, mDataSize, getpid());
     mDataPos = 0;
     ALOGV("setDataReference Setting data pos of %p to %d\n", this, mDataPos);
@@ -1273,7 +1397,11 @@ void Parcel::ipcSetDataReference(const uint8_t* data, size_t dataSize,
     mObjectsSize = mObjectsCapacity = objectsCount;
     mNextObjectHint = 0;
     mOwner = relFunc;
+#ifdef WITH_TAINT_BYTE_PARCEL
+    mpTaintInfo->mOwnerCookie = relCookie;
+#else
     mOwnerCookie = relCookie;
+#endif /*WITH_TAINT_BYTE_PARCEL*/
     scanForFds();
 }
 
@@ -1341,11 +1469,31 @@ void Parcel::freeDataNoInit()
 {
     if (mOwner) {
         //ALOGI("Freeing data ref of %p (pid=%d)\n", this, getpid());
+#ifdef WITH_TAINT_TRACKING
+#ifdef WITH_TAINT_BYTE_PARCEL
+        /* sy- note: in current version, dataSize is not used in the release function */
+        mOwner(this, mData, (mDataSize+sizeof(uint32_t)+mpTaintInfo->mCurAllocatedSize*sizeof(taint_in_parcel)), mObjects, mObjectsSize, mpTaintInfo->mOwnerCookie);
+        if (mpTaintInfo->parcelArray) {
+            free(mpTaintInfo->parcelArray);
+            mpTaintInfo->parcelArray = NULL;
+        }
+#else
+        mOwner(this, mData, (mDataSize+sizeof(mTaintTag)), mObjects, mObjectsSize, mOwnerCookie);
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#else
         mOwner(this, mData, mDataSize, mObjects, mObjectsSize, mOwnerCookie);
+#endif
     } else {
         releaseObjects();
         if (mData) free(mData);
         if (mObjects) free(mObjects);
+#ifdef WITH_TAINT_BYTE_PARCEL
+        if (mpTaintInfo->parcelArray) {
+            free(mpTaintInfo->parcelArray);
+            mpTaintInfo->parcelArray = NULL;
+            mpTaintInfo->mCurAllocatedSize = 0;
+        }
+#endif /*WITH_TAINT_BYTE_PARCEL*/
     }
 }
 
@@ -1364,7 +1512,23 @@ status_t Parcel::restartWrite(size_t desired)
         return continueWrite(desired);
     }
     
+#ifdef WITH_TAINT_TRACKING
+#ifdef WITH_TAINT_BYTE_PARCEL
+    uint8_t* data = (uint8_t*)realloc(mData, (desired+sizeof(uint32_t)));
+    mpTaintInfo->mCurAllocatedSize = 0;
+    if(mpTaintInfo->parcelArray)
+    {
+        free(mpTaintInfo->parcelArray);
+        mpTaintInfo->parcelArray = NULL;
+    }
+    mpTaintInfo->mCurPos = 0;
+    mpTaintInfo->mTaintSize = 0;
+#else
+    uint8_t* data = (uint8_t*)realloc(mData, (desired+sizeof(mTaintTag)));
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#else
     uint8_t* data = (uint8_t*)realloc(mData, desired);
+#endif  
     if (!data && desired > mDataCapacity) {
         mError = NO_MEMORY;
         return NO_MEMORY;
@@ -1418,7 +1582,15 @@ status_t Parcel::continueWrite(size_t desired)
 
         // If there is a different owner, we need to take
         // posession.
+#ifdef WITH_TAINT_TRACKING
+#ifdef WITH_TAINT_BYTE_PARCEL
+        uint8_t* data = (uint8_t*)malloc(desired+sizeof(uint32_t)+sizeof(taint_in_parcel)*mpTaintInfo->mCurAllocatedSize);
+#else
+        uint8_t* data = (uint8_t*)malloc(desired+sizeof(mTaintTag));
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#else
         uint8_t* data = (uint8_t*)malloc(desired);
+#endif
         if (!data) {
             mError = NO_MEMORY;
             return NO_MEMORY;
@@ -1447,7 +1619,16 @@ status_t Parcel::continueWrite(size_t desired)
             memcpy(objects, mObjects, objectsSize*sizeof(size_t));
         }
         //ALOGI("Freeing data ref of %p (pid=%d)\n", this, getpid());
+#ifdef WITH_TAINT_TRACKING
+#ifdef WITH_TAINT_BYTE_PARCEL
+        mOwner(this, mData, (mDataSize+sizeof(uint32_t)+mpTaintInfo->mCurAllocatedSize*sizeof(taint_in_parcel)), mObjects, mObjectsSize, mpTaintInfo->mOwnerCookie);
+        mpTaintInfo->mCurPos = 0;
+#else
+        mOwner(this, mData, (mDataSize+sizeof(mTaintTag)), mObjects, mObjectsSize, mOwnerCookie);
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#else
         mOwner(this, mData, mDataSize, mObjects, mObjectsSize, mOwnerCookie);
+#endif
         mOwner = NULL;
 
         mData = data;
@@ -1482,7 +1663,15 @@ status_t Parcel::continueWrite(size_t desired)
 
         // We own the data, so we can just do a realloc().
         if (desired > mDataCapacity) {
+#ifdef WITH_TAINT_TRACKING
+#ifdef WITH_TAINT_BYTE_PARCEL
+            uint8_t* data = (uint8_t*)realloc(mData, (desired+sizeof(uint32_t)+sizeof(taint_in_parcel)*mpTaintInfo->mCurAllocatedSize));
+#else
+            uint8_t* data = (uint8_t*)realloc(mData, (desired+sizeof(mTaintTag)));
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#else
             uint8_t* data = (uint8_t*)realloc(mData, desired);
+#endif
             if (data) {
                 mData = data;
                 mDataCapacity = desired;
@@ -1503,7 +1692,15 @@ status_t Parcel::continueWrite(size_t desired)
         
     } else {
         // This is the first data.  Easy!
+#ifdef WITH_TAINT_TRACKING
+#ifdef WITH_TAINT_BYTE_PARCEL
+        uint8_t* data = (uint8_t*)malloc(desired+sizeof(uint32_t)+sizeof(taint_in_parcel)*mpTaintInfo->mCurAllocatedSize);
+#else
+        uint8_t* data = (uint8_t*)malloc(desired+sizeof(mTaintTag));
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#else
         uint8_t* data = (uint8_t*)malloc(desired);
+#endif
         if (!data) {
             mError = NO_MEMORY;
             return NO_MEMORY;
@@ -1519,6 +1716,9 @@ status_t Parcel::continueWrite(size_t desired)
         ALOGV("continueWrite Setting data size of %p to %d\n", this, mDataSize);
         ALOGV("continueWrite Setting data pos of %p to %d\n", this, mDataPos);
         mDataCapacity = desired;
+#ifdef WITH_TAINT_BYTE_PARCEL
+        mpTaintInfo->mCurPos = 0;
+#endif /*WITH_TAINT_BYTE_PARCEL*/
     }
 
     return NO_ERROR;
@@ -1541,6 +1741,20 @@ void Parcel::initState()
     mFdsKnown = true;
     mAllowFds = true;
     mOwner = NULL;
+#ifdef WITH_TAINT_TRACKING
+#ifdef WITH_TAINT_BYTE_PARCEL
+    mpTaintInfo->mTaintSize = 0;
+    mpTaintInfo->mCurPos = 0;
+    mpTaintInfo->mCurAllocatedSize = 0;
+    if(mpTaintInfo->parcelArray)
+    {
+        ALOGW("error- parcelArray is not null");
+    }
+    mpTaintInfo->parcelArray = 0;
+#else
+    mTaintTag = 0; /* TAINT_CLEAR */
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#endif
 }
 
 void Parcel::scanForFds() const
@@ -1557,6 +1771,103 @@ void Parcel::scanForFds() const
     mHasFds = hasFds;
     mFdsKnown = true;
 }
+
+#ifdef WITH_TAINT_TRACKING
+void Parcel::updateTaint(const uint32_t tag, const uint32_t start, const uint32_t len)
+{
+#ifdef WITH_TAINT_BYTE_PARCEL
+    if(tag != 0)
+    {
+        if(mpTaintInfo->mCurAllocatedSize && mpTaintInfo->mTaintSize > 0)
+        {
+            struct taint_in_parcel * prev = &mpTaintInfo->parcelArray[mpTaintInfo->mTaintSize-1];
+            if(prev->taint == tag && prev->pos+len == start)
+            {
+                prev->len += len;
+                //ALOGW("Parcel::UpdateTaint(0x%08x)#1 -- parcel = %p pos(%d,%d) %d--\n", tag, this, start, len, mpTaintInfo->mTaintSize);
+                return;
+            }
+        }
+        if(mpTaintInfo->mTaintSize+1 > mpTaintInfo->mCurAllocatedSize)
+        {
+            uint32_t orig_alloc = mpTaintInfo->mCurAllocatedSize;
+
+            if(NULL == mpTaintInfo->parcelArray)
+            {
+                mpTaintInfo->mCurAllocatedSize = INITIAL_NTAINTS;
+                mpTaintInfo->parcelArray = (struct taint_in_parcel *) malloc (sizeof(taint_in_parcel) * mpTaintInfo->mCurAllocatedSize);
+            }
+            else
+            {
+                mpTaintInfo->mCurAllocatedSize = (mpTaintInfo->mCurAllocatedSize < INITIAL_NTAINTS) ? INITIAL_NTAINTS : (mpTaintInfo->mCurAllocatedSize * 2);
+                mpTaintInfo->parcelArray = (struct taint_in_parcel *) realloc (mpTaintInfo->parcelArray, sizeof(taint_in_parcel) * mpTaintInfo->mCurAllocatedSize);
+            }
+
+            if(mOwner)
+            {
+                /* memory problem? */
+                uint8_t* data = (uint8_t*) malloc (mDataSize+sizeof(uint32_t)+sizeof(taint_in_parcel)*mpTaintInfo->mCurAllocatedSize);
+                if(!data)
+                {
+                    ALOGW("updateTaint - NO MEMORY!!!!!!");
+                }
+                memcpy(data, mData, mDataSize);
+                mOwner(this, mData, (mDataSize+sizeof(uint32_t)+orig_alloc*sizeof(taint_in_parcel)), mObjects, mObjectsSize, mpTaintInfo->mOwnerCookie);
+                mOwner = NULL;
+                mData = data;
+            }
+            else
+            {
+                mData = (uint8_t*)realloc(mData, (mDataCapacity+sizeof(uint32_t)+sizeof(taint_in_parcel)*mpTaintInfo->mCurAllocatedSize));
+                //LOGI("realloc - %p %p %d %d", mData, this, mDataCapacity, mpTaintInfo->mCurAllocatedSize);
+            }
+        }
+        struct taint_in_parcel * tp = &mpTaintInfo->parcelArray[mpTaintInfo->mTaintSize];
+        tp->taint = tag;
+        tp->pos = start;
+        tp->len = len;
+
+        mpTaintInfo->mTaintSize ++;
+        mpTaintInfo->mCurPos = 0;
+        //ALOGW("Parcel::UpdateTaint(0x%08x)#2 -- parcel = %p pos(%d,%d) %d--\n", tag, this, start, len, mpTaintInfo->mTaintSize);
+    }
+}
+#else
+    mTaintTag |= tag;
+    //if (tag != 0) {
+        //LOGW("Parcel::UpdateTaint(0x%08x) -- Parcel Taint = 0x%08x --\n", tag, mTaintTag);
+    //}    
+}
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#endif
+
+#ifdef WITH_TAINT_TRACKING
+uint32_t Parcel::getTaint(const uint32_t start, const uint32_t len)
+{
+#ifdef WITH_TAINT_BYTE_PARCEL
+    uint32_t tag = 0;
+    uint32_t end = start + len;
+    if(end < start) return 0; /* overflow */
+    while(mpTaintInfo->mCurPos < mpTaintInfo->mTaintSize)
+    {
+        const taint_in_parcel * tp = &mpTaintInfo->parcelArray[mpTaintInfo->mCurPos];
+        if(tp->pos >= end) break;
+        uint32_t tpend = tp->pos + tp->len;
+        if(tpend > start) tag |= tp->taint;
+        if(tpend > end) break;
+        mpTaintInfo->mCurPos ++;
+    }
+    if(mpTaintInfo->mTaintSize > 0)
+    {
+        //ALOGW("Parcel::getTaint() -- parcel = %p pos(%d,%d) %d 0x%08x--\n", this, start, len, mpTaintInfo->mCurPos, tag);
+    }
+    return tag;
+}
+#else
+    return mTaintTag;
+}
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+#endif
 
 // --- Parcel::Blob ---
 

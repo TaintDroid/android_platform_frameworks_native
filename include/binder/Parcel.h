@@ -35,6 +35,24 @@ class TextOutput;
 
 struct flat_binder_object;  // defined in support_p/binder_module.h
 
+#ifdef WITH_TAINT_BYTE_PARCEL
+struct taint_in_parcel 
+{
+    uint32_t    pos;
+    uint32_t    len;
+    uint32_t    taint;
+};
+
+struct taint_info
+{
+    uint32_t    mTaintSize;
+    uint32_t    mCurPos;
+    uint32_t    mCurAllocatedSize;
+    struct taint_in_parcel * parcelArray;
+    void*        mOwnerCookie;
+};
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+
 class Parcel
 {
 public:
@@ -195,6 +213,12 @@ public:
     
     void                print(TextOutput& to, uint32_t flags = 0) const;
 
+//#ifdef WITH_TAINT_TRACKING
+    // Do not #ifdef this field. Parcel is used by a lot of projects
+    void updateTaint(const uint32_t tag, const uint32_t start, const uint32_t len);
+    uint32_t getTaint(const uint32_t start, const uint32_t len);
+//#endif
+
 private:
                         Parcel(const Parcel& o);
     Parcel&             operator=(const Parcel& o);
@@ -232,7 +256,16 @@ private:
     bool                mAllowFds;
     
     release_func        mOwner;
+#ifdef WITH_TAINT_BYTE_PARCEL
+    struct taint_info * mpTaintInfo;
+#else
     void*               mOwnerCookie;
+#endif /*WITH_TAINT_BYTE_PARCEL*/
+
+//#ifdef WITH_TAINT_TRACKING
+    // Do not #ifdef this field. Parcel is used by a lot of projects
+    uint32_t           mTaintTag;
+//#endif
 
     class Blob {
     public:
